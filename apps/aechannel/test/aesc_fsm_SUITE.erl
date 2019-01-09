@@ -42,6 +42,7 @@
         , change_config_get_history/1
         , multiple_channels/1
         , many_chs_msg_loop/1
+        , check_incorrect_create/1
         ]).
 
 %% exports for aehttp_integration_SUITE
@@ -71,7 +72,8 @@ all() ->
 groups() ->
     [
      {all_tests, [sequence], [ {group, transactions}
-                             , {group, throughput}]},
+                             , {group, throughput},
+                               {group, signatures}]},
      {transactions, [sequence],
       [
         create_channel
@@ -98,8 +100,11 @@ groups() ->
       [
         multiple_channels
       , many_chs_msg_loop
-      ]
-     }
+      ]},
+     {signatures, [sequence],
+      [
+        check_incorrect_create 
+      ]}
     ].
 
 suite() ->
@@ -773,6 +778,48 @@ multiple_channels_t(NumCs, FromPort, Msg, Slogan, Cfg) ->
     [P ! die || P <- Cs],
     ok.
 
+check_incorrect_create(Cfg) ->
+    {I, R, Spec} = channel_spec(Cfg),
+    Port = proplists:get_value(port, Cfg, 9325),
+    CreateData = {I, R, Spec, Port, get_debug(Cfg)},
+    wrong_sig_create(CreateData, initiator),
+    wrong_sig_create(CreateData, responder),
+    ok.
+
+wrong_sig_create({I, R, #{initiator_amount := IAmt0, responder_amount := RAmt0,
+                  push_amount := PushAmount} = Spec, Port, Debug},
+                Malicious) ->
+    BogusPrivkey = <<0:64/unit:8>>,
+    IAmt = IAmt0 - PushAmount,
+    RAmt = RAmt0 + PushAmount,
+    {ok, FsmR} = rpc(dev1, aesc_fsm, respond, [Port, Spec], Debug),
+    {ok, FsmI} = rpc(dev1, aesc_fsm, initiate, ["localhost", Port, Spec], Debug),
+
+    log(Debug, "FSMs, I = ~p, R = ~p", [FsmI, FsmR]),
+
+    I1 = I#{fsm => FsmI, initiator_amount => IAmt, responder_amount => RAmt},
+    R1 = R#{fsm => FsmR, initiator_amount => IAmt, responder_amount => RAmt},
+
+    {ok, _} = receive_from_fsm(info, R1, channel_open, ?TIMEOUT, Debug),
+    {ok, _} = receive_from_fsm(info, I1, channel_accept, ?TIMEOUT, Debug),
+
+    case Malicious of
+        initiator ->
+            {_I2, _} = await_signing_request(create_tx, I1#{priv => BogusPrivkey}, Debug),
+            {ok,_} = receive_from_fsm(info, R1, wrong_signature, ?TIMEOUT, Debug),
+            {ok,_} = receive_from_fsm(info, R1, fun(#{info := {died, normal}}) -> ok end,
+                                      ?TIMEOUT, Debug),
+            {ok,_} = receive_from_fsm(info, I1, fun died_subverted/1, ?TIMEOUT, Debug);
+        responder ->
+            {_I2, _} = await_signing_request(create_tx, I1, Debug),
+            receive_from_fsm(info, R1, funding_created, ?TIMEOUT, Debug),
+            {_R2, _} = await_signing_request(funding_created, R1#{priv => BogusPrivkey}, Debug),
+            {ok,_} = receive_from_fsm(info, I1, wrong_signature, ?TIMEOUT, Debug),
+            {ok,_} = receive_from_fsm(info, I1, fun(#{info := {died, normal}}) -> ok end,
+                                      ?TIMEOUT, Debug),
+            {ok,_} = receive_from_fsm(info, R1, fun died_subverted/1, ?TIMEOUT, Debug)
+    end,
+    ok.
 
 shutdown_(#{fsm := FsmI, channel_id := ChannelId} = I, R) ->
     ok = rpc(dev1, aesc_fsm, shutdown, [FsmI]),

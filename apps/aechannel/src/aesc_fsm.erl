@@ -16,6 +16,7 @@
          leave/1,
          shutdown/1,              %% (fsm())
          client_died/1,           %% (fsm())
+         connection_died/1,       %% (fsm())
          inband_msg/3,
          get_state/1,
          get_poi/2]).
@@ -369,6 +370,11 @@ client_died(Fsm) ->
     lager:debug("client died(~p)", [Fsm]),
     ok = gen_statem:stop(Fsm).
 
+connection_died(Fsm) ->
+    %TODO: possibility for reconnect
+    lager:debug("connection to participant died(~p)", [Fsm]),
+    ok = gen_statem:stop(Fsm).
+
 start_link(#{} = Arg) ->
     gen_statem:start_link(?MODULE, Arg, ?GEN_STATEM_OPTS).
 
@@ -690,9 +696,9 @@ accepted(cast, {?FND_CREATED, Msg}, #data{role = responder} = D) ->
             lager:debug("funding_created: ~p", [SignedTx]),
             D2 = request_signing(
                    ?FND_CREATED, aetx_sign:tx(SignedTx), SignedTx, D1),
-            next_state(awaiting_signature, D2)
-        %% {error, _} = Error ->
-        %%     close(Error, D)
+            next_state(awaiting_signature, D2);
+        {error, Error} ->
+             close(Error, D)
     end;
 accepted(Type, Msg, D) ->
     handle_common_event(Type, Msg, error_all, D).
@@ -707,9 +713,9 @@ half_signed(cast, {?FND_SIGNED, Msg}, #data{role = initiator} = D) ->
             ok = aec_tx_pool:push(SignedTx),
             D2 = D1#data{create_tx = SignedTx},
             {ok, D3} = start_min_depth_watcher(?WATCH_FND, SignedTx, D2),
-            next_state(awaiting_locked, D3)
-        %% {error, _} = Error ->
-        %%     close(Error, D)
+            next_state(awaiting_locked, D3);
+        {error, Error} ->
+            close(Error, D)
     end;
 half_signed(Type, Msg, D) ->
     handle_common_event(Type, Msg, error_all, D).
@@ -1059,6 +1065,12 @@ close_(close_mutual, D) ->
     {stop, normal, D};
 close_(leave, D) ->
     {stop, normal, D};
+close_(wrong_signature, D) ->
+    report(info, wrong_signature, D),
+    {stop, normal, D};
+close_(not_create_tx, D) ->
+    report(info, not_create_tx, D),
+    {stop, normal, D};
 close_(Reason, D) ->
     try send_error_msg(Reason, D)
     catch error:_ -> ignore
@@ -1307,7 +1319,7 @@ error_binary(E) when is_atom(E) ->
     atom_to_binary(E, latin1).
 
 
-terminate(Reason, _State, Data) ->
+terminate(Reason, _State, #data{session = _Session} = Data) ->
     lager:debug("terminate(~p, ~p, _)", [Reason, _State]),
     report(info, {died, Reason}, Data),
     report(debug, {log, win_to_list(Data#data.log)}, Data),
@@ -1696,7 +1708,17 @@ check_funding_created_msg(#{ temporary_channel_id := ChanId
                            , data                 := TxBin } = Msg,
                           #data{ channel_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    {ok, SignedTx, log(rcv, ?FND_CREATED, Msg, Data)}.
+    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
+        {channel_create_tx, CreateTx} ->
+            Initiator = aesc_create_tx:initiator_pubkey(CreateTx),
+            case aetx_sign:verify_half_signed(Initiator, SignedTx) of
+                ok ->
+                    {ok, SignedTx, log(rcv, ?FND_CREATED, Msg, Data)};
+                _ -> {error, wrong_signature}
+            end;
+        _ -> {error, not_create_tx}
+    end.
+          
 
 send_funding_signed_msg(SignedTx, #data{channel_id = Ch,
                                         session    = Sn} = Data) ->
@@ -1710,7 +1732,19 @@ check_funding_signed_msg(#{ temporary_channel_id := ChanId
                           , data                 := TxBin} = Msg,
                           #data{ channel_id = ChanId } = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    {ok, SignedTx, log(rcv, ?FND_SIGNED, Msg, Data)}.
+    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
+        {channel_create_tx, CreateTx} ->
+            Initiator = aesc_create_tx:initiator_pubkey(CreateTx),
+            Responder = aesc_create_tx:responder_pubkey(CreateTx),
+            %%  aetx_sign:verify/2 actually needs aec_trees:trees() so we use
+            %%  aetx_sign:verify_half_signed/2 instead
+            case aetx_sign:verify_half_signed([Initiator, Responder], SignedTx) of
+                ok ->
+                    {ok, SignedTx, log(rcv, ?FND_SIGNED, Msg, Data)};
+                _ -> {error, wrong_signature}
+            end;
+        _ -> {error, not_create_tx}
+    end.
 
 send_funding_locked_msg(#data{channel_id  = TmpChanId,
                               on_chain_id = OnChainId,
