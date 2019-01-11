@@ -43,6 +43,7 @@
         , multiple_channels/1
         , many_chs_msg_loop/1
         , check_incorrect_create/1
+        , check_incorrect_deposit/1
         ]).
 
 %% exports for aehttp_integration_SUITE
@@ -59,6 +60,7 @@
 -define(OP_TRANSFER, 0).
 -define(OP_WITHDRAW, 1).
 -define(OP_DEPOSIT , 2).
+-define(BOGUS_PRIVKEY, <<12345:64/unit:8>>).
 
 -define(LOG(E), ct:log("LINE ~p <== ~p", [?LINE, E])).
 
@@ -105,6 +107,7 @@ groups() ->
      {signatures, [sequence],
       [
         check_incorrect_create 
+      , check_incorrect_deposit
       ]}
     ].
 
@@ -803,7 +806,6 @@ check_incorrect_create(Cfg) ->
 wrong_sig_create({I, R, #{initiator_amount := IAmt0, responder_amount := RAmt0,
                   push_amount := PushAmount} = Spec, Port, Debug},
                 Malicious) ->
-    BogusPrivkey = <<0:64/unit:8>>,
     IAmt = IAmt0 - PushAmount,
     RAmt = RAmt0 + PushAmount,
     {ok, FsmR} = rpc(dev1, aesc_fsm, respond, [Port, Spec], Debug),
@@ -819,7 +821,7 @@ wrong_sig_create({I, R, #{initiator_amount := IAmt0, responder_amount := RAmt0,
 
     case Malicious of
         initiator ->
-            {_I2, _} = await_signing_request(create_tx, I1#{priv => BogusPrivkey}, Debug),
+            {_I2, _} = await_signing_request(create_tx, I1#{priv => ?BOGUS_PRIVKEY}, Debug),
             {ok,_} = receive_from_fsm(info, R1, wrong_signature, ?TIMEOUT, Debug),
             {ok,_} = receive_from_fsm(info, R1, fun(#{info := {died, normal}}) -> ok end,
                                       ?TIMEOUT, Debug),
@@ -827,12 +829,49 @@ wrong_sig_create({I, R, #{initiator_amount := IAmt0, responder_amount := RAmt0,
         responder ->
             {_I2, _} = await_signing_request(create_tx, I1, Debug),
             receive_from_fsm(info, R1, funding_created, ?TIMEOUT, Debug),
-            {_R2, _} = await_signing_request(funding_created, R1#{priv => BogusPrivkey}, Debug),
+            {_R2, _} = await_signing_request(funding_created, R1#{priv => ?BOGUS_PRIVKEY}, Debug),
             {ok,_} = receive_from_fsm(info, I1, wrong_signature, ?TIMEOUT, Debug),
             {ok,_} = receive_from_fsm(info, I1, fun(#{info := {died, normal}}) -> ok end,
                                       ?TIMEOUT, Debug),
             {ok,_} = receive_from_fsm(info, R1, fun died_subverted/1, ?TIMEOUT, Debug)
     end,
+    ok.
+
+check_incorrect_deposit(Cfg) ->
+    Debug = true,
+    #{ i := I
+     , r := R
+     , spec := Spec} = create_channel_([?SLOGAN|Cfg]),
+    Port = proplists:get_value(port, Cfg, ?PORT),
+    Data = {I, R, Spec, Port, Debug},
+    Roles = [initiator, responder],
+    [wrong_sig_deposit(Data, Depositor, Malicious)
+        || Depositor <- Roles,
+           Malicious <- Roles],
+    shutdown_(I, R),
+    ok.
+
+wrong_sig_deposit({I, R, Spec, Port, Debug}, Depositor, Malicious) ->
+    ct:log("Testing with Depositor ~p, Malicious ~p",
+          [Depositor, Malicious]),
+    #{fsm := FsmI} = I,
+    #{fsm := FsmR} = R,
+    {D, A, FsmD} =
+        case Depositor of
+            initiator -> {I, R, FsmI};
+            responder -> {R, I, FsmR}
+        end,
+    ok = rpc(dev1, aesc_fsm, upd_deposit, [FsmD, #{amount => 1}]),
+    case Depositor =:= Malicious of
+        true ->
+            {_, _} = await_signing_request(deposit_tx, D#{priv => ?BOGUS_PRIVKEY}, Debug),
+            {ok, _} = receive_from_fsm(conflict, D, any_msg(), ?TIMEOUT, Debug);
+        false ->
+            {_, _} = await_signing_request(deposit_tx, D, Debug),
+            {_, _} = await_signing_request(deposit_created, A#{priv => ?BOGUS_PRIVKEY}),
+            {ok, _} = receive_from_fsm(conflict, A, any_msg(), ?TIMEOUT, Debug)
+    end,
+    check_info(500),
     ok.
 
 shutdown_(#{fsm := FsmI, channel_id := ChannelId} = I, R) ->

@@ -732,7 +732,9 @@ dep_half_signed(cast, {?DEP_SIGNED, Msg}, D) ->
             report(on_chain_tx, SignedTx, D1),
             ok = aec_tx_pool:push(SignedTx),
             {ok, D2} = start_min_depth_watcher(deposit, SignedTx, D1),
-            next_state(awaiting_locked, D2)
+            next_state(awaiting_locked, D2);
+        {error, _Error} ->
+            handle_update_conflict(?DEP_SIGNED, D)
     end;
 dep_half_signed(cast, {?DEP_ERR, Msg}, D) ->
     lager:debug("received deposit_error: ~p", [Msg]),
@@ -859,6 +861,9 @@ awaiting_locked(cast, {?DEP_LOCKED, _Msg}, D) ->
     postpone(D);
 awaiting_locked(cast, {?WDRAW_LOCKED, _Msg}, D) ->
     postpone(D);
+awaiting_locked(cast, {?DEP_ERR, _Msg}, D) ->
+    %% TODO: Stop min depth watcher!
+    handle_update_conflict(?DEP_SIGNED, D);
 awaiting_locked(Type, Msg, D) ->
     handle_common_event(Type, Msg, error, D).
 
@@ -990,7 +995,9 @@ open(cast, {?DEP_CREATED, Msg}, D) ->
             lager:debug("deposit_created: ~p", [SignedTx]),
             D2 = request_signing(
                    ?DEP_CREATED, aetx_sign:tx(SignedTx), SignedTx, D1),
-            next_state(awaiting_signature, set_ongoing(D2))
+            next_state(awaiting_signature, set_ongoing(D2));
+        {error, _Error} ->
+            handle_update_conflict(?DEP_CREATED, D)
     end;
 open(cast, {?WDRAW_CREATED, Msg}, D) ->
     case check_withdraw_created_msg(Msg, D) of
@@ -1782,7 +1789,16 @@ check_deposit_created_msg(#{ channel_id := ChanId
                            , data       := TxBin} = Msg,
                           #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    {ok, SignedTx, log(rcv, ?DEP_CREATED, Msg, Data)}.
+    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
+        {channel_deposit_tx, _DepositTx} ->
+            Signer = other_participant_pubkey(Data),
+            case aetx_sign:verify_half_signed(Signer, SignedTx) of
+                ok ->
+                    {ok, SignedTx, log(rcv, ?DEP_CREATED, Msg, Data)};
+                _ -> {error, wrong_signature}
+            end;
+        _ -> {error, not_create_tx}
+    end.
 
 send_deposit_signed_msg(SignedTx, #data{on_chain_id = Ch,
                                         session     = Sn} = Data) ->
@@ -1796,7 +1812,17 @@ check_deposit_signed_msg(#{ channel_id := ChanId
                           , data       := TxBin} = Msg,
                           #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    {ok, SignedTx, log(rcv, ?DEP_SIGNED, Msg, Data)}.
+    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
+        {channel_deposit_tx, _DepositTx} ->
+            Me = my_pubkey(Data),
+            Other = other_participant_pubkey(Data),
+            case aetx_sign:verify_half_signed([Me, Other], SignedTx) of
+                ok ->
+                    {ok, SignedTx, log(rcv, ?DEP_SIGNED, Msg, Data)};
+                _ -> {error, wrong_signature}
+            end;
+        _ -> {error, not_create_tx}
+    end.
 
 send_deposit_locked_msg(TxHash, #data{on_chain_id = ChanId,
                                       session     = Sn} = Data) ->
@@ -2175,6 +2201,7 @@ send_conflict_err_msg(Req, #data{ state = State
 conflict_msg_type(?UPDATE)        -> ?UPDATE_ERR;
 conflict_msg_type(?UPDATE_ACK)    -> ?UPDATE_ERR;
 conflict_msg_type(?DEP_CREATED)   -> ?DEP_ERR;
+conflict_msg_type(?DEP_SIGNED)    -> ?DEP_ERR;
 conflict_msg_type(deposit_tx)     -> ?DEP_ERR;
 conflict_msg_type(?WDRAW_CREATED) -> ?WDRAW_ERR;
 conflict_msg_type(withdraw_tx)    -> ?WDRAW_ERR.
@@ -2371,3 +2398,21 @@ process_update_error({off_chain_update_error, Reason}, From, D) ->
 process_update_error(Reason, From, D) ->
     lager:error("CAUGHT ~p, trace = ~p", [Reason, erlang:get_stacktrace()]),
     keep_state(D, [{reply, From, {error, Reason}}]).
+
+my_pubkey(#data{role = Role} = Data) ->
+    get_pubkey_by_role(Role, Data).
+
+other_participant_pubkey(#data{role = Role} = Data) ->
+    case Role of
+        initiator -> get_pubkey_by_role(responder, Data);
+        responder -> get_pubkey_by_role(initiator, Data)
+    end.
+
+get_pubkey_by_role(Role, #data{create_tx = CreateTxSigned})
+        when create_tx =/= undefined ->
+    {channel_create_tx, CreateTx} = aetx:specialize_type(aetx_sign:tx(CreateTxSigned)),
+    case Role of
+        initiator -> aesc_create_tx:initiator_pubkey(CreateTx);
+        responder -> aesc_create_tx:responder_pubkey(CreateTx)
+    end.
+
