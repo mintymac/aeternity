@@ -44,6 +44,7 @@
         , many_chs_msg_loop/1
         , check_incorrect_create/1
         , check_incorrect_deposit/1
+        , check_incorrect_withdrawal/1
         ]).
 
 %% exports for aehttp_integration_SUITE
@@ -108,6 +109,7 @@ groups() ->
       [
         check_incorrect_create 
       , check_incorrect_deposit
+      , check_incorrect_withdrawal
       ]}
     ].
 
@@ -845,30 +847,53 @@ check_incorrect_deposit(Cfg) ->
     Port = proplists:get_value(port, Cfg, ?PORT),
     Data = {I, R, Spec, Port, Debug},
     Roles = [initiator, responder],
-    [wrong_sig_deposit(Data, Depositor, Malicious)
-        || Depositor <- Roles,
-           Malicious <- Roles],
+    Deposit =
+        fun(Depositor, Malicious) ->
+            wrong_sig_action(Data, Depositor, Malicious,
+                             {upd_deposit, #{amount => 1}, deposit_tx, deposit_created})
+        end,
+    [Deposit(Depositor, Malicious) || Depositor <- Roles,
+                                      Malicious <- Roles],
     shutdown_(I, R),
     ok.
 
-wrong_sig_deposit({I, R, Spec, Port, Debug}, Depositor, Malicious) ->
-    ct:log("Testing with Depositor ~p, Malicious ~p",
-          [Depositor, Malicious]),
+check_incorrect_withdrawal(Cfg) ->
+    Debug = true,
+    #{ i := I
+     , r := R
+     , spec := Spec} = create_channel_([?SLOGAN|Cfg]),
+    Port = proplists:get_value(port, Cfg, ?PORT),
+    Data = {I, R, Spec, Port, Debug},
+    Roles = [initiator, responder],
+    Deposit =
+        fun(Depositor, Malicious) ->
+            wrong_sig_action(Data, Depositor, Malicious,
+                             {upd_withdraw, #{amount => 1}, withdraw_tx, withdraw_created})
+        end,
+    [Deposit(Depositor, Malicious) || Depositor <- Roles,
+                                      Malicious <- Roles],
+    shutdown_(I, R),
+    ok.
+
+wrong_sig_action({I, R, _Spec, _Port, Debug}, Poster, Malicious,
+                 {FsmFun, FsmFunArg, FsmNewAction, FsmCreatedAction}) ->
+    ct:log("Testing with Poster ~p, Malicious ~p",
+          [Poster, Malicious]),
     #{fsm := FsmI} = I,
     #{fsm := FsmR} = R,
     {D, A, FsmD} =
-        case Depositor of
+        case Poster of
             initiator -> {I, R, FsmI};
             responder -> {R, I, FsmR}
         end,
-    ok = rpc(dev1, aesc_fsm, upd_deposit, [FsmD, #{amount => 1}]),
-    case Depositor =:= Malicious of
+    ok = rpc(dev1, aesc_fsm, FsmFun, [FsmD, FsmFunArg]),
+    case Poster =:= Malicious of
         true ->
-            {_, _} = await_signing_request(deposit_tx, D#{priv => ?BOGUS_PRIVKEY}, Debug),
+            {_, _} = await_signing_request(FsmNewAction, D#{priv => ?BOGUS_PRIVKEY}, Debug),
             {ok, _} = receive_from_fsm(conflict, D, any_msg(), ?TIMEOUT, Debug);
         false ->
-            {_, _} = await_signing_request(deposit_tx, D, Debug),
-            {_, _} = await_signing_request(deposit_created, A#{priv => ?BOGUS_PRIVKEY}),
+            {_, _} = await_signing_request(FsmNewAction, D, Debug),
+            {_, _} = await_signing_request(FsmCreatedAction, A#{priv => ?BOGUS_PRIVKEY}),
             {ok, _} = receive_from_fsm(conflict, A, any_msg(), ?TIMEOUT, Debug)
     end,
     check_info(500),

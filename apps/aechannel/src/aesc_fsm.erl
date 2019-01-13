@@ -788,7 +788,9 @@ wdraw_half_signed(cast, {?WDRAW_SIGNED, Msg}, D) ->
             report(on_chain_tx, SignedTx, D1),
             ok = aec_tx_pool:push(SignedTx),
             {ok, D2} = start_min_depth_watcher(withdraw, SignedTx, D1),
-            next_state(awaiting_locked, D2)
+            next_state(awaiting_locked, D2);
+        {error, _Error} ->
+            handle_update_conflict(?WDRAW_SIGNED, D)
     end;
 wdraw_half_signed(cast, {?WDRAW_ERR, Msg}, D) ->
     lager:debug("received withdraw_error: ~p", [Msg]),
@@ -864,6 +866,9 @@ awaiting_locked(cast, {?WDRAW_LOCKED, _Msg}, D) ->
 awaiting_locked(cast, {?DEP_ERR, _Msg}, D) ->
     %% TODO: Stop min depth watcher!
     handle_update_conflict(?DEP_SIGNED, D);
+awaiting_locked(cast, {?WDRAW_ERR, _Msg}, D) ->
+    %% TODO: Stop min depth watcher!
+    handle_update_conflict(?WDRAW_SIGNED, D);
 awaiting_locked(Type, Msg, D) ->
     handle_common_event(Type, Msg, error, D).
 
@@ -1006,7 +1011,9 @@ open(cast, {?WDRAW_CREATED, Msg}, D) ->
             lager:debug("withdraw_created: ~p", [SignedTx]),
             D2 = request_signing(
                    ?WDRAW_CREATED, aetx_sign:tx(SignedTx), SignedTx, D1),
-            next_state(awaiting_signature, set_ongoing(D2))
+            next_state(awaiting_signature, set_ongoing(D2));
+        {error, _Error} ->
+            handle_update_conflict(?WDRAW_CREATED, D)
     end;
 open(cast, {?INBAND_MSG, Msg}, D) ->
     NewD = case check_inband_msg(Msg, D) of
@@ -1797,7 +1804,7 @@ check_deposit_created_msg(#{ channel_id := ChanId
                     {ok, SignedTx, log(rcv, ?DEP_CREATED, Msg, Data)};
                 _ -> {error, wrong_signature}
             end;
-        _ -> {error, not_create_tx}
+        _ -> {error, not_deposit_tx}
     end.
 
 send_deposit_signed_msg(SignedTx, #data{on_chain_id = Ch,
@@ -1821,7 +1828,7 @@ check_deposit_signed_msg(#{ channel_id := ChanId
                     {ok, SignedTx, log(rcv, ?DEP_SIGNED, Msg, Data)};
                 _ -> {error, wrong_signature}
             end;
-        _ -> {error, not_create_tx}
+        _ -> {error, not_deposit_tx}
     end.
 
 send_deposit_locked_msg(TxHash, #data{on_chain_id = ChanId,
@@ -1887,7 +1894,16 @@ check_withdraw_created_msg(#{ channel_id := ChanId
                             , data       := TxBin} = Msg,
                            #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    {ok, SignedTx, log(rcv, ?WDRAW_CREATED, Msg, Data)}.
+    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
+        {channel_withdraw_tx, _WithdrawTx} ->
+            Signer = other_participant_pubkey(Data),
+            case aetx_sign:verify_half_signed(Signer, SignedTx) of
+                ok ->
+                    {ok, SignedTx, log(rcv, ?WDRAW_CREATED, Msg, Data)};
+                _ -> {error, wrong_signature}
+            end;
+        _ -> {error, not_withdraw_tx}
+    end.
 
 send_withdraw_signed_msg(SignedTx, #data{on_chain_id = Ch,
                                          session     = Sn} = Data) ->
@@ -1901,7 +1917,17 @@ check_withdraw_signed_msg(#{ channel_id := ChanId
                            , data       := TxBin} = Msg,
                           #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    {ok, SignedTx, log(rcv, ?WDRAW_SIGNED, Msg, Data)}.
+    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
+        {channel_withdraw_tx, _DepositTx} ->
+            Me = my_pubkey(Data),
+            Other = other_participant_pubkey(Data),
+            case aetx_sign:verify_half_signed([Me, Other], SignedTx) of
+                ok ->
+                    {ok, SignedTx, log(rcv, ?WDRAW_SIGNED, Msg, Data)};
+                _ -> {error, wrong_signature}
+            end;
+        _ -> {error, not_withdraw_tx}
+    end.
 
 send_withdraw_locked_msg(TxHash, #data{on_chain_id = ChanId,
                                        session     = Sn} = Data) ->
@@ -2204,6 +2230,7 @@ conflict_msg_type(?DEP_CREATED)   -> ?DEP_ERR;
 conflict_msg_type(?DEP_SIGNED)    -> ?DEP_ERR;
 conflict_msg_type(deposit_tx)     -> ?DEP_ERR;
 conflict_msg_type(?WDRAW_CREATED) -> ?WDRAW_ERR;
+conflict_msg_type(?WDRAW_SIGNED)  -> ?WDRAW_ERR;
 conflict_msg_type(withdraw_tx)    -> ?WDRAW_ERR.
 
 send_conflict_msg(?UPDATE_ERR, Sn, Msg) ->
