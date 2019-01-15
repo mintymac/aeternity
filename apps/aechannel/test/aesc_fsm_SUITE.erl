@@ -823,7 +823,17 @@ wrong_sig_create({I, R, #{initiator_amount := IAmt0, responder_amount := RAmt0,
 
     case Malicious of
         initiator ->
-            {_I2, _} = await_signing_request(create_tx, I1#{priv => ?BOGUS_PRIVKEY}, Debug),
+            % default behavor - FSM guards you from sending a bad signature
+            {_I2, WrongSignedTx} = await_signing_request(create_tx, I1#{priv => ?BOGUS_PRIVKEY}, Debug),
+            {ok, _} = receive_from_fsm(error, I1, bad_signature, ?TIMEOUT, Debug),
+
+            % turn default behavior off, the initator deliberatly had sent
+            % invalid tx, the responder must reject it
+            ok = rpc(dev1, aesc_fsm, strict_sig_checks, [FsmI, false], Debug),
+
+            % resend the same wrong tx, this time no check from initiator's
+            % side
+            aesc_fsm:signing_response(FsmI, create_tx, WrongSignedTx),
             {ok,_} = receive_from_fsm(info, R1, wrong_signature, ?TIMEOUT, Debug),
             {ok,_} = receive_from_fsm(info, R1, fun(#{info := {died, normal}}) -> ok end,
                                       ?TIMEOUT, Debug),
@@ -831,7 +841,17 @@ wrong_sig_create({I, R, #{initiator_amount := IAmt0, responder_amount := RAmt0,
         responder ->
             {_I2, _} = await_signing_request(create_tx, I1, Debug),
             receive_from_fsm(info, R1, funding_created, ?TIMEOUT, Debug),
-            {_R2, _} = await_signing_request(funding_created, R1#{priv => ?BOGUS_PRIVKEY}, Debug),
+            % default behavor - FSM guards you from sending a bad signature
+            {_R2, WrongSignedTx} = await_signing_request(funding_created, R1#{priv => ?BOGUS_PRIVKEY}, Debug),
+            {ok, _} = receive_from_fsm(error, R1, bad_signature, ?TIMEOUT, Debug),
+
+            % turn default behavior off, the responder deliberatly had sent
+            % invalid tx, the initiator must reject it
+            ok = rpc(dev1, aesc_fsm, strict_sig_checks, [FsmR, false], Debug),
+
+            % resend the same wrong tx, this time no check from responder's
+            % side
+            aesc_fsm:signing_response(FsmR, funding_created, WrongSignedTx),
             {ok,_} = receive_from_fsm(info, I1, wrong_signature, ?TIMEOUT, Debug),
             {ok,_} = receive_from_fsm(info, I1, fun(#{info := {died, normal}}) -> ok end,
                                       ?TIMEOUT, Debug),
@@ -881,20 +901,35 @@ wrong_sig_action({I, R, _Spec, _Port, Debug}, Poster, Malicious,
           [Poster, Malicious]),
     #{fsm := FsmI} = I,
     #{fsm := FsmR} = R,
-    {D, A, FsmD} =
+    {D, A, FsmD, FsmA} =
         case Poster of
-            initiator -> {I, R, FsmI};
-            responder -> {R, I, FsmR}
+            initiator -> {I, R, FsmI, FsmR};
+            responder -> {R, I, FsmR, FsmI}
         end,
     ok = rpc(dev1, aesc_fsm, FsmFun, [FsmD, FsmFunArg]),
     case Poster =:= Malicious of
         true ->
-            {_, _} = await_signing_request(FsmNewAction, D#{priv => ?BOGUS_PRIVKEY}, Debug),
-            {ok, _} = receive_from_fsm(conflict, D, any_msg(), ?TIMEOUT, Debug);
+            % default behavor - FSM guards you from sending a bad signature
+            {_, WrongSignedTx} = await_signing_request(FsmNewAction, D#{priv => ?BOGUS_PRIVKEY}, Debug),
+            {ok, _} = receive_from_fsm(error, D, bad_signature, ?TIMEOUT, Debug),
+
+            % turn default behavior off, the poster deliberatly had sent
+            % invalid tx, the acknowledger must reject it
+            ok = rpc(dev1, aesc_fsm, strict_sig_checks, [FsmD, false], Debug),
+
+            % resend the same wrong tx, this time no check from poster's
+            % side
+            aesc_fsm:signing_response(FsmD, FsmNewAction, WrongSignedTx),
+
+            {ok, _} = receive_from_fsm(conflict, D, any_msg(), ?TIMEOUT, Debug),
+            % make sure setting back defaults
+            ok = rpc(dev1, aesc_fsm, strict_sig_checks, [FsmD, true], Debug);
         false ->
             {_, _} = await_signing_request(FsmNewAction, D, Debug),
+            ok = rpc(dev1, aesc_fsm, strict_sig_checks, [FsmA, false], Debug),
             {_, _} = await_signing_request(FsmCreatedAction, A#{priv => ?BOGUS_PRIVKEY}),
-            {ok, _} = receive_from_fsm(conflict, A, any_msg(), ?TIMEOUT, Debug)
+            {ok, _} = receive_from_fsm(conflict, A, any_msg(), ?TIMEOUT, Debug),
+            ok = rpc(dev1, aesc_fsm, strict_sig_checks, [FsmA, true], Debug)
     end,
     check_info(500),
     ok.

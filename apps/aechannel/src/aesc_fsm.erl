@@ -21,6 +21,8 @@
          get_state/1,
          get_poi/2]).
 
+-export([strict_sig_checks/2]). %% tests only
+
 %% Inspection and configuration functions
 -export([ get_history/1     %% (fsm()) -> [Event]
         , change_config/3   %% (fsm(), key(), value()) -> ok | {error,_}
@@ -140,6 +142,7 @@
               , ongoing_update = false :: boolean()
               , last_reported_update   :: undefined | non_neg_integer()
               , log = #w{}             :: #w{}
+              , check_signatures = true:: boolean()
               }).
 
 -define(TRANSITION_STATE(S),  S=:=awaiting_signature
@@ -355,6 +358,14 @@ get_state(Fsm) ->
 -spec get_poi(pid(), list()) -> {ok, aec_trees:poi()} | {error, not_found}.
 get_poi(Fsm, Filter) ->
     gen_statem:call(Fsm, {get_poi, Filter}).
+
+%% This is supposed to be used in tests only. If Alice stops checking
+%% her own signatures, Bob will still check hers and will reject any wrongly
+%% signed txs. There is a risk for Alice corrupting her own state if using
+%% this function
+-spec strict_sig_checks(pid(), boolean()) -> ok.
+strict_sig_checks(Fsm, Strict) when is_boolean(Strict) ->
+    gen_statem:call(Fsm, {strict_sig_checks, Strict}).
 
 leave(Fsm) ->
     lager:debug("leave(~p)", [Fsm]),
@@ -608,48 +619,66 @@ awaiting_signature(cast, {Req, _} = Msg, #data{ongoing_update = true} = D)
     handle_update_conflict(Req, D);
 awaiting_signature(cast, {?SIGNED, create_tx, Tx} = Msg,
                    #data{role = initiator, latest = {sign, create_tx, _CTx}} = D) ->
-    next_state(half_signed,
-               send_funding_created_msg(
-                 Tx, log(rcv, ?SIGNED, Msg, D#data{latest = undefined})));
+    maybe_check_sigs_create(Tx, initiator,
+                            fun() ->
+                                next_state(half_signed, send_funding_created_msg(
+                                    Tx, log(rcv, ?SIGNED, Msg,
+                                            D#data{latest = undefined})))
+                            end, D);
 awaiting_signature(cast, {?SIGNED, deposit_tx, Tx} = Msg,
                    #data{latest = {sign, deposit_tx, _DTx}} = D) ->
-    next_state(dep_half_signed,
-               send_deposit_created_msg(
-                 Tx, log(rcv, ?SIGNED, Msg, D#data{latest = undefined})));
+    maybe_check_sigs(Tx, channel_deposit_tx, not_deposit_tx, me,
+        fun() ->
+            next_state(dep_half_signed,
+                  send_deposit_created_msg(
+                  Tx, log(rcv, ?SIGNED, Msg, D#data{latest = undefined})))
+        end, D);
 awaiting_signature(cast, {?SIGNED, withdraw_tx, Tx} = Msg,
                    #data{latest = {sign, withdraw_tx, _DTx}} = D) ->
-    next_state(wdraw_half_signed,
-               send_withdraw_created_msg(
-                 Tx, log(rcv, ?SIGNED, Msg, D#data{latest = undefined})));
+    maybe_check_sigs(Tx, channel_withdraw_tx, not_withdraw_tx, me,
+        fun() ->
+            next_state(wdraw_half_signed,
+                    send_withdraw_created_msg(
+                    Tx, log(rcv, ?SIGNED, Msg, D#data{latest = undefined})))
+        end, D);
 awaiting_signature(cast, {?SIGNED, ?FND_CREATED, SignedTx} = Msg,
                    #data{role = responder,
                          latest = {sign, ?FND_CREATED, HSCTx}} = D) ->
     NewSignedTx = aetx_sign:add_signatures(
                     HSCTx, aetx_sign:signatures(SignedTx)),
-    D1 = send_funding_signed_msg(
-           NewSignedTx,
-           log(rcv, ?SIGNED, Msg, D#data{create_tx = NewSignedTx})),
-    report(on_chain_tx, NewSignedTx, D1),
-    {ok, D2} = start_min_depth_watcher(?WATCH_FND, NewSignedTx, D1),
-    gproc_register_on_chain_id(D2),
-    next_state(awaiting_locked, D2);
+    maybe_check_sigs_create(NewSignedTx, both,
+        fun() ->
+            D1 = send_funding_signed_msg(
+                  NewSignedTx,
+                  log(rcv, ?SIGNED, Msg, D#data{create_tx = NewSignedTx})),
+            report(on_chain_tx, NewSignedTx, D1),
+            {ok, D2} = start_min_depth_watcher(?WATCH_FND, NewSignedTx, D1),
+            gproc_register_on_chain_id(D2),
+            next_state(awaiting_locked, D2)
+        end, D);
 awaiting_signature(cast, {?SIGNED, ?DEP_CREATED, SignedTx} = Msg,
                    #data{latest = {sign, ?DEP_CREATED, HSCTx}} = D) ->
     NewSignedTx = aetx_sign:add_signatures(
                     HSCTx, aetx_sign:signatures(SignedTx)),
-    D1 = send_deposit_signed_msg(NewSignedTx, D),
-    report(on_chain_tx, NewSignedTx, D1),
-    {ok, D2} = start_min_depth_watcher(?WATCH_DEP, NewSignedTx, D1),
-    next_state(awaiting_locked,
-               log(rcv, ?SIGNED, Msg, D2));
+    maybe_check_sigs(NewSignedTx, channel_deposit_tx, not_deposit_tx, both,
+        fun() ->
+            D1 = send_deposit_signed_msg(NewSignedTx, D),
+            report(on_chain_tx, NewSignedTx, D1),
+            {ok, D2} = start_min_depth_watcher(?WATCH_DEP, NewSignedTx, D1),
+            next_state(awaiting_locked,
+                      log(rcv, ?SIGNED, Msg, D2))
+        end, D);
 awaiting_signature(cast, {?SIGNED, ?WDRAW_CREATED, SignedTx} = Msg,
                    #data{latest = {sign, ?WDRAW_CREATED, HSCTx}} = D) ->
     NewSignedTx = aetx_sign:add_signatures(
                     HSCTx, aetx_sign:signatures(SignedTx)),
-    D1 = send_withdraw_signed_msg(NewSignedTx, D#data{latest = undefined}),
-    report(on_chain_tx, NewSignedTx, D1),
-    {ok, D2} = start_min_depth_watcher(?WATCH_WDRAW, NewSignedTx, D1),
-    next_state(awaiting_locked, log(rcv, ?SIGNED, Msg, D2));
+    maybe_check_sigs(NewSignedTx, channel_withdraw_tx, not_withdraw_tx, both,
+        fun() ->
+            D1 = send_withdraw_signed_msg(NewSignedTx, D#data{latest = undefined}),
+            report(on_chain_tx, NewSignedTx, D1),
+            {ok, D2} = start_min_depth_watcher(?WATCH_WDRAW, NewSignedTx, D1),
+            next_state(awaiting_locked, log(rcv, ?SIGNED, Msg, D2))
+        end, D);
 awaiting_signature(cast, {?SIGNED, ?UPDATE, SignedTx} = Msg, D) ->
     D1 = send_update_msg(
            SignedTx,
@@ -1264,6 +1293,8 @@ handle_call_(_, get_round, From, #data{ state = State } = D) ->
 handle_call_(_, prune_local_calls, From, #data{ state = State0 } = D) ->
     State = aesc_offchain_state:prune_calls(State0),
     keep_state(D#data{state = State}, [{reply, From, ok}]);
+handle_call_(_, {strict_sig_checks, Strict}, From, #data{} = D) ->
+    keep_state(D#data{check_signatures = Strict}, [{reply, From, ok}]);
 handle_call_(St, _Req, _From, D) when ?TRANSITION_STATE(St) ->
     postpone(D);
 handle_call_(_St, _Req, From, D) ->
@@ -1294,6 +1325,8 @@ handle_common_event_(cast, {?CHANNEL_CLOSING, ChanId} = Msg, _St, _,
                      #data{on_chain_id = ChanId} = D) ->
     lager:debug("got ~p", [Msg]),
     close(channel_closing_on_chain, D);
+handle_common_event_({call, From}, {strict_sig_checks, Strict}, _, _, #data{} = D) ->
+    keep_state(D#data{check_signatures = Strict}, [{reply, From, ok}]);
 handle_common_event_({call, From}, Req, St, Mode, D) ->
     case Mode of
         error_all ->
@@ -1722,15 +1755,11 @@ check_funding_created_msg(#{ temporary_channel_id := ChanId
                            , data                 := TxBin } = Msg,
                           #data{ channel_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
-        {channel_create_tx, CreateTx} ->
-            Initiator = aesc_create_tx:initiator_pubkey(CreateTx),
-            case aetx_sign:verify_half_signed(Initiator, SignedTx) of
-                ok ->
-                    {ok, SignedTx, log(rcv, ?FND_CREATED, Msg, Data)};
-                _ -> {error, wrong_signature}
-            end;
-        _ -> {error, not_create_tx}
+    case verify_signatures_channel_create(SignedTx, initiator) of
+        ok ->
+            {ok, SignedTx, log(rcv, ?FND_CREATED, Msg, Data)};
+        {error, _} = Err ->
+            Err
     end.
           
 
@@ -1746,18 +1775,11 @@ check_funding_signed_msg(#{ temporary_channel_id := ChanId
                           , data                 := TxBin} = Msg,
                           #data{ channel_id = ChanId } = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
-        {channel_create_tx, CreateTx} ->
-            Initiator = aesc_create_tx:initiator_pubkey(CreateTx),
-            Responder = aesc_create_tx:responder_pubkey(CreateTx),
-            %%  aetx_sign:verify/2 actually needs aec_trees:trees() so we use
-            %%  aetx_sign:verify_half_signed/2 instead
-            case aetx_sign:verify_half_signed([Initiator, Responder], SignedTx) of
-                ok ->
-                    {ok, SignedTx, log(rcv, ?FND_SIGNED, Msg, Data)};
-                _ -> {error, wrong_signature}
-            end;
-        _ -> {error, not_create_tx}
+    case verify_signatures_channel_create(SignedTx, both) of
+        ok ->
+            {ok, SignedTx, log(rcv, ?FND_SIGNED, Msg, Data)};
+        {error, _} = Err ->
+            Err
     end.
 
 send_funding_locked_msg(#data{channel_id  = TmpChanId,
@@ -1796,15 +1818,12 @@ check_deposit_created_msg(#{ channel_id := ChanId
                            , data       := TxBin} = Msg,
                           #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
-        {channel_deposit_tx, _DepositTx} ->
-            Signer = other_participant_pubkey(Data),
-            case aetx_sign:verify_half_signed(Signer, SignedTx) of
-                ok ->
-                    {ok, SignedTx, log(rcv, ?DEP_CREATED, Msg, Data)};
-                _ -> {error, wrong_signature}
-            end;
-        _ -> {error, not_deposit_tx}
+    case check_type_and_verify_signatures(SignedTx, channel_deposit_tx,
+                                          [other_account(Data)],
+                                          not_deposit_tx) of
+        ok ->
+            {ok, SignedTx, log(rcv, ?DEP_CREATED, Msg, Data)};
+        {error, _} = Err -> Err
     end.
 
 send_deposit_signed_msg(SignedTx, #data{on_chain_id = Ch,
@@ -1819,16 +1838,13 @@ check_deposit_signed_msg(#{ channel_id := ChanId
                           , data       := TxBin} = Msg,
                           #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
-        {channel_deposit_tx, _DepositTx} ->
-            Me = my_pubkey(Data),
-            Other = other_participant_pubkey(Data),
-            case aetx_sign:verify_half_signed([Me, Other], SignedTx) of
-                ok ->
-                    {ok, SignedTx, log(rcv, ?DEP_SIGNED, Msg, Data)};
-                _ -> {error, wrong_signature}
-            end;
-        _ -> {error, not_deposit_tx}
+    case check_type_and_verify_signatures(SignedTx, channel_deposit_tx,
+                                          [other_account(Data),
+                                           my_account(Data)],
+                                          not_deposit_tx) of
+        ok ->
+            {ok, SignedTx, log(rcv, ?DEP_SIGNED, Msg, Data)};
+        {error, _} = Err -> Err
     end.
 
 send_deposit_locked_msg(TxHash, #data{on_chain_id = ChanId,
@@ -1894,15 +1910,12 @@ check_withdraw_created_msg(#{ channel_id := ChanId
                             , data       := TxBin} = Msg,
                            #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
-        {channel_withdraw_tx, _WithdrawTx} ->
-            Signer = other_participant_pubkey(Data),
-            case aetx_sign:verify_half_signed(Signer, SignedTx) of
-                ok ->
-                    {ok, SignedTx, log(rcv, ?WDRAW_CREATED, Msg, Data)};
-                _ -> {error, wrong_signature}
-            end;
-        _ -> {error, not_withdraw_tx}
+    case check_type_and_verify_signatures(SignedTx, channel_withdraw_tx,
+                                          [other_account(Data)],
+                                          not_withdraw_tx) of
+        ok ->
+            {ok, SignedTx, log(rcv, ?WDRAW_CREATED, Msg, Data)};
+        {error, _} = Err -> Err
     end.
 
 send_withdraw_signed_msg(SignedTx, #data{on_chain_id = Ch,
@@ -1917,16 +1930,13 @@ check_withdraw_signed_msg(#{ channel_id := ChanId
                            , data       := TxBin} = Msg,
                           #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
-        {channel_withdraw_tx, _DepositTx} ->
-            Me = my_pubkey(Data),
-            Other = other_participant_pubkey(Data),
-            case aetx_sign:verify_half_signed([Me, Other], SignedTx) of
-                ok ->
-                    {ok, SignedTx, log(rcv, ?WDRAW_SIGNED, Msg, Data)};
-                _ -> {error, wrong_signature}
-            end;
-        _ -> {error, not_withdraw_tx}
+    case check_type_and_verify_signatures(SignedTx, channel_withdraw_tx,
+                                          [other_account(Data),
+                                           my_account(Data)],
+                                          not_withdraw_tx) of
+        ok ->
+            {ok, SignedTx, log(rcv, ?WDRAW_SIGNED, Msg, Data)};
+        {error, _} = Err -> Err
     end.
 
 send_withdraw_locked_msg(TxHash, #data{on_chain_id = ChanId,
@@ -2426,20 +2436,76 @@ process_update_error(Reason, From, D) ->
     lager:error("CAUGHT ~p, trace = ~p", [Reason, erlang:get_stacktrace()]),
     keep_state(D, [{reply, From, {error, Reason}}]).
 
-my_pubkey(#data{role = Role} = Data) ->
-    get_pubkey_by_role(Role, Data).
-
-other_participant_pubkey(#data{role = Role} = Data) ->
-    case Role of
-        initiator -> get_pubkey_by_role(responder, Data);
-        responder -> get_pubkey_by_role(initiator, Data)
+-spec verify_signatures_channel_create(aetx_sign:signed_tx(),
+                                       initiator | both) -> ok | {error, atom()}.
+verify_signatures_channel_create(SignedTx, Who) ->
+    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
+        {channel_create_tx, CreateTx} ->
+            Pubkeys =
+                case Who of
+                    initiator ->
+                        Initiator = aesc_create_tx:initiator_pubkey(CreateTx),
+                        [Initiator];
+                    both ->
+                        Initiator = aesc_create_tx:initiator_pubkey(CreateTx),
+                        Responder = aesc_create_tx:responder_pubkey(CreateTx),
+                        [Initiator, Responder]
+            end,
+            verify_signatures(Pubkeys, SignedTx);
+        _ -> {error, not_create_tx}
     end.
 
-get_pubkey_by_role(Role, #data{create_tx = CreateTxSigned})
-        when create_tx =/= undefined ->
-    {channel_create_tx, CreateTx} = aetx:specialize_type(aetx_sign:tx(CreateTxSigned)),
-    case Role of
-        initiator -> aesc_create_tx:initiator_pubkey(CreateTx);
-        responder -> aesc_create_tx:responder_pubkey(CreateTx)
+verify_signatures(Pubkeys, SignedTx) ->
+    %%  aetx_sign:verify/2 actually needs aec_trees:trees() so we use
+    %%  aetx_sign:verify_half_signed/2 instead
+    case aetx_sign:verify_half_signed(Pubkeys, SignedTx) of
+        ok ->
+            ok;
+        _ -> {error, wrong_signature}
+    end.
+
+check_type_and_verify_signatures(SignedTx, Type, Pubkeys, ErrTypeMsg) ->
+    case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
+        {Type, _Tx} ->
+            verify_signatures(Pubkeys, SignedTx);
+        _ -> {error, ErrTypeMsg}
+    end.
+
+maybe_check_sigs_create(Tx, Who, NextState, D) ->
+    CheckSigs =
+        case D#data.check_signatures of
+            true ->
+                ok =:= verify_signatures_channel_create(Tx, Who);
+            false -> true
+        end,
+    case CheckSigs of
+        true -> NextState();
+        false ->
+            report(error, bad_signature, D),
+            keep_state(D)
+    end.
+
+maybe_check_sigs(Tx, TxType, WrongTxTypeMsg, Who, NextState, D)
+        when Who =:= me
+      orelse Who =:= other_participant
+      orelse Who =:= both ->
+    Pubkeys =
+        case Who of
+            me -> [my_account(D)];
+            other_participant -> [other_account(D)];
+            both -> [my_account(D), other_account(D)]
+        end,
+    CheckSigs =
+        case D#data.check_signatures of
+            true ->
+                ok =:= check_type_and_verify_signatures(Tx, TxType,
+                                                        Pubkeys, WrongTxTypeMsg);
+            false -> true
+        end,
+    case CheckSigs of
+        true -> NextState();
+        false ->
+            report(error, bad_signature, D),
+            keep_state(D)
     end.
 
