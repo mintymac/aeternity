@@ -680,25 +680,31 @@ awaiting_signature(cast, {?SIGNED, ?WDRAW_CREATED, SignedTx} = Msg,
             next_state(awaiting_locked, log(rcv, ?SIGNED, Msg, D2))
         end, D);
 awaiting_signature(cast, {?SIGNED, ?UPDATE, SignedTx} = Msg, D) ->
-    D1 = send_update_msg(
-           SignedTx,
-           D#data{state = aesc_offchain_state:set_half_signed_tx(
-                            SignedTx, D#data.state)}),
-    next_state(awaiting_update_ack,
-               log(rcv, ?SIGNED, Msg, D1#data{latest = undefined}));
+    maybe_check_sigs(SignedTx, channel_offchain_tx, not_offchain_tx, me,
+        fun() ->
+            D1 = send_update_msg(
+                  SignedTx,
+                  D#data{state = aesc_offchain_state:set_half_signed_tx(
+                                    SignedTx, D#data.state)}),
+            next_state(awaiting_update_ack,
+                      log(rcv, ?SIGNED, Msg, D1#data{latest = undefined}))
+        end, D);
 awaiting_signature(cast, {?SIGNED, ?UPDATE_ACK, SignedTx} = Msg,
                    #data{latest = {sign, ?UPDATE_ACK, OCTx}, opts = Opts} = D) ->
     NewSignedTx = aetx_sign:add_signatures(
                     OCTx, aetx_sign:signatures(SignedTx)),
-    D1 = send_update_ack_msg(NewSignedTx, D),
-    {OnChainEnv, OnChainTrees} =
-        aetx_env:tx_env_and_trees_from_top(aetx_contract),
-    State = aesc_offchain_state:set_signed_tx(NewSignedTx, D1#data.state,
-                                              OnChainTrees, OnChainEnv, Opts),
-    D2 = D1#data{log   = log_msg(rcv, ?SIGNED, Msg, D1#data.log),
-                 state = State,
-                 latest = undefined},
-    next_state(open, D2);
+    maybe_check_sigs(NewSignedTx, channel_offchain_tx, not_offchain_tx, both,
+        fun() ->
+            D1 = send_update_ack_msg(NewSignedTx, D),
+            {OnChainEnv, OnChainTrees} =
+                aetx_env:tx_env_and_trees_from_top(aetx_contract),
+            State = aesc_offchain_state:set_signed_tx(NewSignedTx, D1#data.state,
+                                                      OnChainTrees, OnChainEnv, Opts),
+            D2 = D1#data{log   = log_msg(rcv, ?SIGNED, Msg, D1#data.log),
+                        state = State,
+                        latest = undefined},
+            next_state(open, D2)
+        end, D);
 awaiting_signature(cast, {?SIGNED, ?SHUTDOWN, SignedTx} = Msg, D) ->
     D1 = send_shutdown_msg(SignedTx, D),
     D2 = D1#data{latest = {shutdown, SignedTx},
@@ -928,8 +934,8 @@ awaiting_update_ack(cast, {?UPDATE_ACK, Msg}, #data{} = D) ->
     case check_update_ack_msg(Msg, D) of
         {ok, D1} ->
             next_state(open, D1);
-        {error, _} = Error ->
-            close(Error, D)
+        {error, _Error} ->
+            handle_update_conflict(?UPDATE_ACK, D)
     end;
 awaiting_update_ack(cast, {?UPDATE, _} = Msg, D) ->
     lager:debug("race detected: ~p", [Msg]),
@@ -944,6 +950,11 @@ awaiting_update_ack(cast, {?UPDATE_ERR, Msg}, D) ->
             %% TODO: send a different kind of report (e.g. validation error)
             report(conflict, Msg, D1),
             next_state(open, D1);
+        {error, fallback_state_mismatch} = Error ->
+            % falling back to an inconsistent state
+            % this is possible if we are a malicious actor only 
+            report(conflict, Msg, D),
+            close(Error, D);
         {error, _} = Error ->
             close(Error, D)
     end;
@@ -1018,10 +1029,14 @@ open(cast, {?UPDATE, Msg}, D) ->
             D2 = request_signing(
                    ?UPDATE_ACK, aetx_sign:tx(SignedTx), SignedTx, D1),
             next_state(awaiting_signature, set_ongoing(D2));
-        {error,_} = Error ->
-            %% TODO: do we do a dispute challenge here?
-            close(Error, D)
+        {error, _Error} ->
+            handle_update_conflict(?UPDATE, D)
     end;
+open(cast, {?UPDATE_ERR, Msg}, D) ->
+    %% this will happen only if we are malicious, this does cause invalid
+    %% state
+    report(conflict, Msg, D),
+    keep_state(D);
 open(cast, {?DEP_CREATED, Msg}, D) ->
     case check_deposit_created_msg(Msg, D) of
         {ok, SignedTx, D1} ->
@@ -1877,21 +1892,21 @@ check_withdraw_error_msg(Msg, D) ->
     check_op_error_msg(?WDRAW_ERR, Msg, D).
 
 check_op_error_msg(Op, #{ channel_id := ChanId
-                        , round      := Round
                         , error_code := ErrCode } = Msg,
                         #data{on_chain_id = ChanId0,
                               state = State} = D) ->
+    {LastRound, _} = aesc_offchain_state:get_latest_signed_tx(State),
     case ChanId == ChanId0 of
         true ->
             case aesc_offchain_state:get_fallback_state(State) of
-                {Round, State1} ->
+                {LastRound, State1} -> % same round
                     {ok, ErrCode,
                      D#data{state = State1,
                             log = log_msg(
                                     rcv, Op, Msg, D#data.log)}};
                 _Other ->
                     lager:debug("Fallback state mismatch: ~p/~p",
-                                [Round, _Other]),
+                                [LastRound, _Other]),
                     {error, fallback_state_mismatch}
             end;
         false ->
@@ -1911,7 +1926,7 @@ check_withdraw_created_msg(#{ channel_id := ChanId
                            #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
     case check_type_and_verify_signatures(SignedTx, channel_withdraw_tx,
-                                          [other_account(Data)],
+                                          pubkeys(other_participant, Data),
                                           not_withdraw_tx) of
         ok ->
             {ok, SignedTx, log(rcv, ?WDRAW_CREATED, Msg, Data)};
@@ -1931,8 +1946,7 @@ check_withdraw_signed_msg(#{ channel_id := ChanId
                           #data{on_chain_id = ChanId} = Data) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
     case check_type_and_verify_signatures(SignedTx, channel_withdraw_tx,
-                                          [other_account(Data),
-                                           my_account(Data)],
+                                          pubkeys(both, Data),
                                           not_withdraw_tx) of
         ok ->
             {ok, SignedTx, log(rcv, ?WDRAW_SIGNED, Msg, Data)};
@@ -1994,11 +2008,16 @@ check_update_msg_(Type, #{ channel_id := ChanId
 check_signed_update_tx(Type, SignedTx, Msg,
                        #data{state = State, opts = Opts} = D) ->
     lager:debug("check_signed_update_tx(~p)", [SignedTx]),
-    case check_update_tx(Type, SignedTx, State, Opts) of
+    case check_type_and_verify_signatures(SignedTx, channel_offchain_tx,
+                                          pubkeys(other_participant, D), not_offchain_tx) of
         ok ->
-            {ok, SignedTx, log(rcv, ?UPDATE, Msg, D)};
-        {error, _} = Error ->
-            Error
+            case check_update_tx(Type, SignedTx, State, Opts) of
+                ok ->
+                    {ok, SignedTx, log(rcv, ?UPDATE, Msg, D)};
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Err -> Err
     end.
 
 check_update_tx(initial, SignedTx, State, Opts) ->
@@ -2007,10 +2026,10 @@ check_update_tx(initial, SignedTx, State, Opts) ->
     aesc_offchain_state:check_initial_update_tx(SignedTx, State,
                                                 OnChainTrees, OnChainEnv, Opts);
 check_update_tx(normal, SignedTx, State, Opts) ->
-    {OnChainEnv, OnChainTrees} =
-        aetx_env:tx_env_and_trees_from_top(aetx_contract),
-    aesc_offchain_state:check_update_tx(SignedTx, State,
-                                        OnChainTrees, OnChainEnv, Opts).
+      {OnChainEnv, OnChainTrees} =
+          aetx_env:tx_env_and_trees_from_top(aetx_contract),
+      aesc_offchain_state:check_update_tx(SignedTx, State,
+                                          OnChainTrees, OnChainEnv, Opts).
 
 check_update_ack_msg(Msg, D) ->
     lager:debug("check_update_ack_msg(~p)", [Msg]),
@@ -2037,11 +2056,16 @@ check_signed_update_ack_tx(SignedTx, Msg,
                            #data{state = State, opts = Opts} = D) ->
     HalfSignedTx = aesc_offchain_state:get_latest_half_signed_tx(State),
     try  ok = check_update_ack_(SignedTx, HalfSignedTx),
-         {OnChainEnv, OnChainTrees} =
-            aetx_env:tx_env_and_trees_from_top(aetx_contract),
-         {ok, D#data{state = aesc_offchain_state:set_signed_tx(
-                               SignedTx, State, OnChainTrees, OnChainEnv, Opts),
-                     log = log_msg(rcv, ?UPDATE_ACK, Msg, D#data.log)}}
+         case check_type_and_verify_signatures(SignedTx, channel_offchain_tx,
+                                          pubkeys(both, D), not_offchain_tx) of
+              ok ->
+                  {OnChainEnv, OnChainTrees} =
+                      aetx_env:tx_env_and_trees_from_top(aetx_contract),
+                  {ok, D#data{state = aesc_offchain_state:set_signed_tx(
+                                        SignedTx, State, OnChainTrees, OnChainEnv, Opts),
+                              log = log_msg(rcv, ?UPDATE_ACK, Msg, D#data.log)}};
+              {error, _} = Err -> Err
+          end
     catch
         error:E ->
             lager:error("CAUGHT ~p, trace = ~p", [E, erlang:get_stacktrace()]),
@@ -2489,12 +2513,7 @@ maybe_check_sigs(Tx, TxType, WrongTxTypeMsg, Who, NextState, D)
         when Who =:= me
       orelse Who =:= other_participant
       orelse Who =:= both ->
-    Pubkeys =
-        case Who of
-            me -> [my_account(D)];
-            other_participant -> [other_account(D)];
-            both -> [my_account(D), other_account(D)]
-        end,
+    Pubkeys = pubkeys(Who, D),
     CheckSigs =
         case D#data.check_signatures of
             true ->
@@ -2509,3 +2528,9 @@ maybe_check_sigs(Tx, TxType, WrongTxTypeMsg, Who, NextState, D)
             keep_state(D)
     end.
 
+pubkeys(Who, D) ->
+    case Who of
+        me -> [my_account(D)];
+        other_participant -> [other_account(D)];
+        both -> [my_account(D), other_account(D)]
+    end.

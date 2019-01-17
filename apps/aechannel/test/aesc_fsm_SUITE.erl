@@ -45,6 +45,7 @@
         , check_incorrect_create/1
         , check_incorrect_deposit/1
         , check_incorrect_withdrawal/1
+        , check_incorrect_update/1
         ]).
 
 %% exports for aehttp_integration_SUITE
@@ -110,6 +111,7 @@ groups() ->
         check_incorrect_create 
       , check_incorrect_deposit
       , check_incorrect_withdrawal
+      , check_incorrect_update
       ]}
     ].
 
@@ -870,7 +872,7 @@ check_incorrect_deposit(Cfg) ->
     Deposit =
         fun(Depositor, Malicious) ->
             wrong_sig_action(Data, Depositor, Malicious,
-                             {upd_deposit, #{amount => 1}, deposit_tx, deposit_created})
+                             {upd_deposit, [#{amount => 1}], deposit_tx, deposit_created})
         end,
     [Deposit(Depositor, Malicious) || Depositor <- Roles,
                                       Malicious <- Roles],
@@ -888,11 +890,40 @@ check_incorrect_withdrawal(Cfg) ->
     Deposit =
         fun(Depositor, Malicious) ->
             wrong_sig_action(Data, Depositor, Malicious,
-                             {upd_withdraw, #{amount => 1}, withdraw_tx, withdraw_created})
+                             {upd_withdraw, [#{amount => 1}], withdraw_tx, withdraw_created})
         end,
     [Deposit(Depositor, Malicious) || Depositor <- Roles,
                                       Malicious <- Roles],
     shutdown_(I, R),
+    ok.
+
+check_incorrect_update(Cfg) ->
+    Test =
+        fun(Depositor, Malicious) ->
+            Debug = true,
+            #{ i := #{pub := IPub, fsm := FsmI} = I
+            , r := #{pub := RPub, fsm := FsmR} = R
+            , spec := Spec} = create_channel_([?SLOGAN|Cfg]),
+            Port = proplists:get_value(port, Cfg, ?PORT),
+            Data = {I, R, Spec, Port, Debug},
+            Deposit =
+                fun() ->
+                    wrong_sig_action(Data, Depositor, Malicious,
+                                    {upd_transfer, [IPub, RPub, 1], update, update_ack})
+                end,
+            Deposit(),
+            AliveFsm =
+                case Depositor of
+                    initiator -> FsmI;
+                    responder -> FsmR
+                end,
+            ok = gen_statem:stop(AliveFsm),
+            timer:sleep(1000), % so all sockets are free
+            ok
+          end,
+    Roles = [initiator, responder],
+    [Test(Depositor, Malicious) || Depositor <- Roles,
+                                   Malicious <- Roles],
     ok.
 
 wrong_sig_action({I, R, _Spec, _Port, Debug}, Poster, Malicious,
@@ -906,7 +937,7 @@ wrong_sig_action({I, R, _Spec, _Port, Debug}, Poster, Malicious,
             initiator -> {I, R, FsmI, FsmR};
             responder -> {R, I, FsmR, FsmI}
         end,
-    ok = rpc(dev1, aesc_fsm, FsmFun, [FsmD, FsmFunArg]),
+    ok = rpc(dev1, aesc_fsm, FsmFun, [FsmD | FsmFunArg]),
     case Poster =:= Malicious of
         true ->
             % default behavor - FSM guards you from sending a bad signature
@@ -969,7 +1000,7 @@ on_disk(St) ->  proplists:get_value(on_disk, St).
 
 
 collect_acks([Pid | Pids], Tag, N) ->
-    Timeout = 30000 + (N div 10)*5000,  % wild guess
+    Timeout = 60000 + (N div 10)*5000,  % wild guess
     receive
         {Pid, Tag} ->
             [Pid | collect_acks(Pids, Tag, N)]
