@@ -62,7 +62,7 @@ handle_call(Request, _From, State) ->
     {reply, ok, State}.
 
 handle_cast(Other, State) ->
-    epoch_sync:error("Received unknown cast: ~p", [Other]),
+    epoch_sync:warning("Received unknown cast: ~p", [Other]),
     {noreply, State}.
 
 handle_info(add_port_mapping, State) ->
