@@ -72,7 +72,7 @@ handle_info(add_port_mapping, State) ->
     erlang:send_after(1000 * (?MAPPING_LIFETIME - 10), self(), add_port_mapping),
     {noreply, State};
 handle_info(Other, State) ->
-    epoch_sync:error("Received unknown info message: ~p", [Other]),
+    epoch_sync:warning("Received unknown info message: ~p", [Other]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
