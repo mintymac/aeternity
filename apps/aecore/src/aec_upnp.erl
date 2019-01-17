@@ -58,7 +58,7 @@ init(Args) ->
     {ok, Args}.
 
 handle_call(Request, _From, State) ->
-    epoch_sync:error("Received unknown request: ~p", [Request]),
+    epoch_sync:warning("Received unknown request: ~p", [Request]),
     {reply, ok, State}.
 
 handle_cast(Other, State) ->
