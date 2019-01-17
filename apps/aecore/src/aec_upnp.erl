@@ -99,7 +99,8 @@ add_port_mapping() ->
             end;
         no_nat ->
             epoch_sync:warning("UPnP/NAT-PMP discovery failed")
-    end.
+    end,
+    ok.
 
 delete_port_mapping() ->
     case nat:discover() of
