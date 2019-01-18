@@ -64,7 +64,7 @@
   0},
  {<<"nat">>,
   {git,"https://github.com/zp-sd/erlang-nat.git",
-      {ref,"957c28adcdcdb37b56f06591eb55feee868bcaac"}},
+      {ref,"b78177a045d123be11cc0a781b91c9602e9d47cb"}},
   0},
  {<<"parse_trans">>,{pkg,<<"parse_trans">>,<<"3.3.0">>},1},
  {<<"poolboy">>,{pkg,<<"poolboy">>,<<"1.5.1">>},0},
