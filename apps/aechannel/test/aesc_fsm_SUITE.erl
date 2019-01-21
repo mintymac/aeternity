@@ -46,6 +46,7 @@
         , check_incorrect_deposit/1
         , check_incorrect_withdrawal/1
         , check_incorrect_update/1
+        , check_incorrect_mutual_close/1
         ]).
 
 %% exports for aehttp_integration_SUITE
@@ -112,6 +113,7 @@ groups() ->
       , check_incorrect_deposit
       , check_incorrect_withdrawal
       , check_incorrect_update
+      , check_incorrect_mutual_close
       ]}
     ].
 
@@ -926,8 +928,40 @@ check_incorrect_update(Cfg) ->
                                    Malicious <- Roles],
     ok.
 
+check_incorrect_mutual_close(Cfg) ->
+    Test =
+        fun(Depositor, Malicious) ->
+            Debug = true,
+            #{ i := #{fsm := FsmI} = I
+            , r := #{fsm := FsmR} = R
+            , spec := Spec} = create_channel_([?SLOGAN|Cfg]),
+            Port = proplists:get_value(port, Cfg, ?PORT),
+            Data = {I, R, Spec, Port, Debug},
+            wrong_sig_action(Data, Depositor, Malicious,
+                            {shutdown, [], shutdown,
+                              shutdown_ack},
+                            fun(#{fsm := FsmPid}, _Debug) ->
+                                timer:sleep(1000),
+                                true = rpc(dev1, erlang, process_info, [FsmPid]) =:= undefined
+                            end),
+            ok
+          end,
+    Roles = [initiator, responder],
+    [Test(Depositor, Malicious) || Depositor <- Roles,
+                                   Malicious <- Roles],
+    ok.
+
+wrong_sig_action(ChannelStuff, Poster, Malicious,
+                 FsmStuff) ->
+    wrong_sig_action(ChannelStuff, Poster, Malicious,
+                  FsmStuff,
+                  fun(Who, DebugL) ->
+                      {ok, _} = receive_from_fsm(conflict, Who, any_msg(), ?TIMEOUT, DebugL)
+                  end).
+
 wrong_sig_action({I, R, _Spec, _Port, Debug}, Poster, Malicious,
-                 {FsmFun, FsmFunArg, FsmNewAction, FsmCreatedAction}) ->
+                 {FsmFun, FsmFunArg, FsmNewAction, FsmCreatedAction},
+                  DetectConflictFun) ->
     ct:log("Testing with Poster ~p, Malicious ~p",
           [Poster, Malicious]),
     #{fsm := FsmI} = I,
@@ -952,15 +986,15 @@ wrong_sig_action({I, R, _Spec, _Port, Debug}, Poster, Malicious,
             % side
             aesc_fsm:signing_response(FsmD, FsmNewAction, WrongSignedTx),
 
-            {ok, _} = receive_from_fsm(conflict, D, any_msg(), ?TIMEOUT, Debug),
-            % make sure setting back defaults
-            ok = rpc(dev1, aesc_fsm, strict_sig_checks, [FsmD, true], Debug);
+            DetectConflictFun(D, Debug),
+            % make sure setting back defaults if process is still there
+            rpc(dev1, aesc_fsm, strict_sig_checks, [FsmD, true], Debug);
         false ->
             {_, _} = await_signing_request(FsmNewAction, D, Debug),
             ok = rpc(dev1, aesc_fsm, strict_sig_checks, [FsmA, false], Debug),
             {_, _} = await_signing_request(FsmCreatedAction, A#{priv => ?BOGUS_PRIVKEY}),
-            {ok, _} = receive_from_fsm(conflict, A, any_msg(), ?TIMEOUT, Debug),
-            ok = rpc(dev1, aesc_fsm, strict_sig_checks, [FsmA, true], Debug)
+            DetectConflictFun(A, Debug),
+            rpc(dev1, aesc_fsm, strict_sig_checks, [FsmA, true], Debug)
     end,
     check_info(500),
     ok.

@@ -706,19 +706,25 @@ awaiting_signature(cast, {?SIGNED, ?UPDATE_ACK, SignedTx} = Msg,
             next_state(open, D2)
         end, D);
 awaiting_signature(cast, {?SIGNED, ?SHUTDOWN, SignedTx} = Msg, D) ->
-    D1 = send_shutdown_msg(SignedTx, D),
-    D2 = D1#data{latest = {shutdown, SignedTx},
-                 log    = log_msg(rcv, ?SIGNED, Msg, D1#data.log)},
-    next_state(closing, D2);
+    maybe_check_sigs(SignedTx, channel_close_mutual_tx, not_close_mutual_tx, me,
+        fun() ->
+            D1 = send_shutdown_msg(SignedTx, D),
+            D2 = D1#data{latest = {shutdown, SignedTx},
+                        log    = log_msg(rcv, ?SIGNED, Msg, D1#data.log)},
+            next_state(closing, D2)
+        end, D);
 awaiting_signature(cast, {?SIGNED, ?SHUTDOWN_ACK, SignedTx} = Msg,
                    #data{latest = {sign, ?SHUTDOWN_ACK, CMTx}} = D) ->
     NewSignedTx = aetx_sign:add_signatures(
                     CMTx, aetx_sign:signatures(SignedTx)),
-    D1 = send_shutdown_ack_msg(NewSignedTx, D),
-    D2 = D1#data{latest = undefined,
-                 log    = log_msg(rcv, ?SIGNED, Msg, D1#data.log)},
-    report(on_chain_tx, NewSignedTx, D1),
-    close(close_mutual, D2);
+    maybe_check_sigs(NewSignedTx, channel_close_mutual_tx, not_close_mutual_tx, both,
+        fun() ->
+            D1 = send_shutdown_ack_msg(NewSignedTx, D),
+            D2 = D1#data{latest = undefined,
+                        log    = log_msg(rcv, ?SIGNED, Msg, D1#data.log)},
+            report(on_chain_tx, NewSignedTx, D1),
+            close(close_mutual, D2)
+        end, D);
 %% Other
 awaiting_signature(Type, Msg, D) ->
     handle_common_event(Type, Msg, postpone, D).
@@ -2148,18 +2154,25 @@ shutdown_msg(SignedTx, #data{ on_chain_id = OnChainId }) ->
 check_shutdown_msg(#{channel_id := ChanId, data := TxBin} = Msg,
                    #data{on_chain_id = ChanId, state = State} = D) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    {_, LatestSignedTx} = aesc_offchain_state:get_latest_signed_tx(State),
-    OtherAcct = other_account(D),
-    {ok, FakeCloseTx} = close_mutual_tx(OtherAcct, 0, LatestSignedTx, D),
-    RealCloseTx = aetx_sign:tx(SignedTx),
-    {channel_close_mutual_tx, FakeTxI} = aetx:specialize_type(FakeCloseTx),
-    {channel_close_mutual_tx, RealTxI} = aetx:specialize_type(RealCloseTx),
-    case (serialize_close_mutual_tx(FakeTxI) ==
-              serialize_close_mutual_tx(RealTxI)) of
-        true ->
-            {ok, SignedTx, log(rcv, ?SHUTDOWN, Msg, D)};
-        false ->
-            {error, shutdown_tx_validation}
+    case check_type_and_verify_signatures(SignedTx, channel_close_mutual_tx,
+                                          [other_account(D)],
+                                          not_close_mutual_tx) of
+        ok ->
+            {_, LatestSignedTx} = aesc_offchain_state:get_latest_signed_tx(State),
+            OtherAcct = other_account(D),
+            {ok, FakeCloseTx} = close_mutual_tx(OtherAcct, 0, LatestSignedTx, D),
+            RealCloseTx = aetx_sign:tx(SignedTx),
+            {channel_close_mutual_tx, FakeTxI} = aetx:specialize_type(FakeCloseTx),
+            {channel_close_mutual_tx, RealTxI} = aetx:specialize_type(RealCloseTx),
+            case (serialize_close_mutual_tx(FakeTxI) ==
+                      serialize_close_mutual_tx(RealTxI)) of
+                true ->
+                    {ok, SignedTx, log(rcv, ?SHUTDOWN, Msg, D)};
+                false ->
+                    {error, shutdown_tx_validation}
+            end;
+        {error, _} = Err ->
+            Err
     end.
 
 serialize_close_mutual_tx(Tx) ->
@@ -2169,11 +2182,14 @@ serialize_close_mutual_tx(Tx) ->
 check_shutdown_ack_msg(#{data := TxBin} = Msg,
                        #data{latest = {shutdown, MySignedTx}} = D) ->
     SignedTx = aetx_sign:deserialize_from_binary(TxBin),
-    case aetx_sign:signatures(SignedTx) of
-        [_,_] ->
+    case check_type_and_verify_signatures(SignedTx, channel_close_mutual_tx,
+                                          [other_account(D),
+                                           my_account(D)],
+                                          not_close_mutual_tx) of
+        ok ->
             check_shutdown_msg_(SignedTx, MySignedTx, Msg, D);
-        _ ->
-            {error, not_mutually_signed}
+        {error, _} = Err ->
+            Err
     end.
 
 check_shutdown_msg_(SignedTx, MySignedTx, Msg, D) ->
@@ -2492,7 +2508,8 @@ check_type_and_verify_signatures(SignedTx, Type, Pubkeys, ErrTypeMsg) ->
     case aetx:specialize_type(aetx_sign:tx(SignedTx)) of
         {Type, _Tx} ->
             verify_signatures(Pubkeys, SignedTx);
-        _ -> {error, ErrTypeMsg}
+        _E ->
+            {error, ErrTypeMsg}
     end.
 
 maybe_check_sigs_create(Tx, Who, NextState, D) ->
